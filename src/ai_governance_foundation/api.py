@@ -8,9 +8,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .domain import FORBIDDEN_CONTENT_FIELDS
 from .errors import DomainError, ValidationError
+from .risk import RiskCommunicationService
 from .service import DomainService
 from .storage import Database
+
+
+def _reject_raw_content(body: dict[str, Any]) -> None:
+    leaked = sorted(key for key in body if key in FORBIDDEN_CONTENT_FIELDS)
+    if leaked:
+        raise ValidationError(f"禁止提交原始敏感内容字段: {', '.join(leaked)}；只接受脱敏摘要与内容指纹")
 
 
 def route(service: DomainService, method: str, path: str, body: dict[str, Any] | None,
@@ -21,22 +29,24 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
     body = body or {}
     parsed = urlparse(path)
     actor_id = headers.get("X-Actor-Id", "")
+    risk = RiskCommunicationService(service.database, service.clock)
+    parts = [segment for segment in parsed.path.split("/") if segment]
     try:
         if method == "GET" and parsed.path == "/health":
             valid, count = service.verify_audit()
             return 200, {"status": "ok", "audit_valid": valid, "audit_events": count}
         if method == "POST" and parsed.path == "/organizations":
             receipt = service.register_organization(actor_id=actor_id, **body)
-            return 200 if receipt.replayed else 201, receipt.__dict__
+            return 200 if receipt.replayed else 201, receipt.as_dict()
         if method == "POST" and parsed.path == "/actors":
             receipt = service.register_actor(actor_id=actor_id, **body)
-            return 200 if receipt.replayed else 201, receipt.__dict__
+            return 200 if receipt.replayed else 201, receipt.as_dict()
         if method == "POST" and parsed.path == "/sites":
             receipt = service.register_site(actor_id=actor_id, **body)
-            return 200 if receipt.replayed else 201, receipt.__dict__
+            return 200 if receipt.replayed else 201, receipt.as_dict()
         if method == "POST" and parsed.path == "/domain-records":
             receipt = service.record_domain_data(actor_id=actor_id, **body)
-            return 200 if receipt.replayed else 201, receipt.__dict__
+            return 200 if receipt.replayed else 201, receipt.as_dict()
         if method == "GET" and parsed.path == "/domain-records":
             query = parse_qs(parsed.query)
             site_id = query.get("site_id", [""])[0]
@@ -48,6 +58,51 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+
+        # ---------------------------------------------------------- 跨机构风险沟通
+        if parts and parts[0] == "risk":
+            query = parse_qs(parsed.query)
+
+            if method == "POST" and len(parts) == 2 and parts[1] == "incidents":
+                _reject_raw_content(body)
+                receipt = risk.submit_incident(actor_id=actor_id, **body)
+                return 200 if receipt.replayed else 201, receipt.as_dict()
+
+            if method == "GET" and len(parts) == 2 and parts[1] == "pending":
+                after_sequence = int(query.get("after_sequence", ["0"])[0])
+                limit = int(query.get("limit", ["100"])[0])
+                return 200, risk.pull_pending(actor_id, after_sequence=after_sequence, limit=limit)
+
+            if len(parts) >= 3 and parts[1] == "incidents":
+                incident_id = parts[2]
+
+                if method == "GET" and len(parts) == 3:
+                    return 200, risk.get_incident(actor_id, incident_id)
+
+                if method == "POST" and len(parts) == 4 and parts[3] == "revisions":
+                    _reject_raw_content(body)
+                    receipt = risk.revise_incident(actor_id=actor_id, incident_id=incident_id, **body)
+                    return 200 if receipt.replayed else 201, receipt.as_dict()
+
+                if method == "POST" and len(parts) == 4 and parts[3] == "withdrawal":
+                    receipt = risk.withdraw_incident(actor_id=actor_id, incident_id=incident_id, **body)
+                    return 200 if receipt.replayed else 201, receipt.as_dict()
+
+                if method == "POST" and len(parts) == 4 and parts[3] == "local-references":
+                    receipt = risk.map_local_reference(actor_id=actor_id, incident_id=incident_id, **body)
+                    return 200 if receipt.replayed else 201, receipt.as_dict()
+
+                if method == "POST" and len(parts) == 4 and parts[3] == "level-proposals":
+                    receipt = risk.propose_level(actor_id=actor_id, incident_id=incident_id, **body)
+                    return 200 if receipt.replayed else 201, receipt.as_dict()
+
+                if method == "GET" and len(parts) == 4 and parts[3] == "receipt-status":
+                    return 200, risk.receipt_status(actor_id, incident_id)
+
+            if method == "POST" and len(parts) == 4 and parts[1] == "advisories" and parts[3] == "acknowledgements":
+                receipt = risk.acknowledge_advisory(actor_id=actor_id, **body)
+                return 200 if receipt.replayed else 201, receipt.as_dict()
+
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
